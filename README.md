@@ -1,12 +1,12 @@
-# 🚦 Agent-Based Traffic Optimization: Static vs. Dynamic Signal Control
+# 🚦 Agent-Based Traffic Optimisation: Static vs. Dynamic Signal Control
 ### A "Digital Twin" Traffic Simulation of Leicester, UK built with NetLogo & GIS
 
 ![Project Status](https://img.shields.io/badge/Status-Completed-success) ![NetLogo](https://img.shields.io/badge/Built%20With-NetLogo%206.3-blue) ![License](https://img.shields.io/badge/License-MIT-green)
 
 ## 📖 Overview
-This project is an **Agent-Based Model (ABM)** designed to simulate and optimize urban traffic flow in a high-density area of Leicester, England. By integrating real-world **GIS (Geographic Information System)** data, the simulation creates a realistic topology to test two distinct traffic control paradigms: **Static (Fixed-Time)** vs. **Dynamic (Sensor-Based)** signaling.
+This project is an **Agent-Based Model (ABM)** designed to simulate and optimise urban traffic flow in a high-density area of Leicester, England. By integrating real-world **GIS (Geographic Information System)** data, the simulation creates a realistic topology to test two distinct traffic control paradigms: **Static (Fixed-Time)** vs. **Dynamic (Sensor-Based)** signaling.
 
-The core objective is to quantify the environmental impact of traffic logic. Unlike standard distance-based models, this project utilizes a custom **Physics Engine** to calculate CO₂ emissions based on vehicle inertia ($a = v_t - v_{t-1}$), proving that "Green Waves" significantly reduce pollution by minimizing stop-and-go driving.
+The core objective is to quantify the environmental impact of traffic logic. Unlike standard distance-based models, this project utilises a custom **Physics Engine** to calculate CO₂ emissions based on vehicle inertia ($a = v_t - v_{t-1}$), proving that "Green Waves" significantly reduce pollution by minimizing stop-and-go driving.
 
 ## 🌟 Key Features
 
@@ -47,11 +47,11 @@ The simulation was stress-tested over a **1-Year timeline** using **CPU Multi-th
 ## 💻 Tech Stack
 * **Language:** NetLogo 6.3
 * **Data Sources:** OpenStreetMap (Overpass Turbo), BBBike.org
-* **Optimization:** Spatial Hashing, Agent-Parallelism
+* **Optimisation:** Spatial Hashing, Agent-Parallelism
 * **Analysis:** BehaviorSpace (Headless execution)
 
 ## 🚀 How to Run
-1.  **Clone the repo:** `git clone https://github.com/yourusername/traffic-abm.git`
+1.  **Clone the repo:** `git clone https://github.com/TNZRalf/Static-vs-Dynamic-Leciester-traffic-light-simulation`
 2.  **Open:** Launch **NetLogo 6.3** and open `Traffic_Simulation.nlogo`.
 3.  **Setup:** Click `Setup` to load the GIS data and spawn agents.
 4.  **Configure:** Select `Static` or `Dynamic` from the "Mode" chooser.
