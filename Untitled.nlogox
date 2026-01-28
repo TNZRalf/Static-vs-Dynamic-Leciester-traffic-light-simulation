@@ -1,0 +1,1615 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.2" snapToGrid="true">
+  <code><![CDATA[extensions [ gis ]
+
+;; Section 1: System Variables & Configuration
+
+globals [
+  ; GIS Data Containers
+  roads-dataset buildings-dataset waterways-dataset natural-dataset points-dataset
+
+  ; Visual Assets
+  road-color
+  boundary-patches
+
+  ; Performance Metrics
+  total-co2             ; Accumulator for total kg of CO2
+  avg-speed             ; Raw NetLogo speed
+  avg-speed-mph         ; Converted to real-world MPH
+  stopped-cars-count    ; Count of cars with speed < 0.1
+  completed-trips       ; Successful arrivals
+  congestion-percent    ; Calculated % of fleet currently stuck
+
+  ; Timekeeping System
+  current-time-string   ; "06:00 AM"
+  current-date-string   ; "Jan 01, 2026"
+  sim-day sim-month sim-year
+  days-tracker          ; Internal counter for date flipping
+  days-elapsed          ; Master stop-clock for termination
+]
+
+patches-own [ is-road? ]
+
+breed [ cars car ]
+breed [ lights light ]
+
+cars-own [
+  speed
+  max-speed
+  target-patch
+  patience
+  my-emissions
+  
+  ; Physics Memory (Inertia calculation)
+  previous-speed
+  
+  ; Navigation Robustness (Anti-Loop logic)
+  last-distance-to-target  ; Snapshot of position 10 ticks ago
+  stuck-timer              ; Counter: "How long have I been failing?"
+]
+
+lights-own [
+  green?
+  light-timer
+  my-junction-patches
+  min-green-time
+]
+
+;; Section 2: Initialization & World Building
+
+to setup
+  clear-all
+  clear-output
+  output-print ">> System Initializing... Loading GIS Data."
+
+  ; Reset Counters
+  set total-co2 0
+  set avg-speed 0
+  set avg-speed-mph 0
+  set stopped-cars-count 0
+  set completed-trips 0
+  set congestion-percent 0
+
+  ; Initialize Calendar (Leicester Local Time)
+  set sim-day 1
+  set sim-month 1
+  set sim-year 2026
+  set days-tracker 0
+  set days-elapsed 0
+  set current-time-string "06:00 AM"
+  update-date-string
+
+  ; GIS Import Routine
+  
+  ; Load Shapefiles
+  set roads-dataset     gis:load-dataset "roads.shp"
+  set buildings-dataset gis:load-dataset "buildings.shp"
+  set waterways-dataset gis:load-dataset "waterways.shp"
+  set natural-dataset   gis:load-dataset "natural.shp"
+  set points-dataset    gis:load-dataset "export (3).shp"
+
+  ; Projection Logic (Auto-Crop to City Center)
+  let max-y 52.63046
+  let min-y 52.62548
+  let min-x -1.14756
+  let max-x -1.13472
+  let my-envelope (list min-x max-x min-y max-y)
+
+  ; Scale Calculation (Preserving Aspect Ratio)
+  let center-lat (min-y + max-y) / 2
+  let width-deg (max-x - min-x)
+  let height-deg (max-y - min-y)
+  let width-m width-deg * 111320 * cos center-lat
+  let height-m height-deg * 110574
+
+  let target-width 1000
+  let scale-ratio (target-width / width-m)
+  let target-height (height-m * scale-ratio)
+
+  resize-world 0 target-width 0 target-height
+  set-patch-size 1
+  gis:set-world-envelope my-envelope
+
+  ; Topology Rendering
+  
+  ask patches [ set pcolor white set is-road? false ]
+
+  ; Layer 1: Environment (Water & Parks)
+  foreach gis:feature-list-of natural-dataset [ feature ->
+    let my-color 55
+    let type-tag ""
+    carefully [ set type-tag gis:property-value feature "type" ] []
+    if type-tag = "" [ carefully [ set type-tag gis:property-value feature "natural" ] [] ]
+    if (type-tag = "water") or (type-tag = "river") or (type-tag = "riverbank") or (type-tag = "canal") [
+      set my-color 105
+    ]
+    gis:set-drawing-color my-color
+    gis:fill feature 1
+  ]
+  gis:set-drawing-color 105
+  gis:draw waterways-dataset 1.5
+
+  ; Layer 2: Structures
+  gis:set-drawing-color 5
+  gis:draw buildings-dataset 0.5
+  gis:fill buildings-dataset 0.5
+
+  ; Layer 3: Transport Network
+  set road-color 130
+  gis:set-drawing-color road-color
+  gis:draw roads-dataset 2.5
+  gis:draw roads-dataset 3
+  gis:draw roads-dataset 3.5
+  gis:draw roads-dataset 2.5
+
+  ; Road Network Repair (The "Pothole Filler")
+  
+  ; Clean edges
+  ask patches [
+    if (pxcor <= min-pxcor + 2) or (pxcor >= max-pxcor - 2) or
+       (pycor <= min-pycor + 2) or (pycor >= max-pycor - 2) [
+      set pcolor white
+    ]
+  ]
+
+  ; Bake drawing to patches
+  export-view "temp_map.png"
+  import-pcolors "temp_map.png"
+  clear-drawing
+
+  ; Define drivable surfaces
+  ask patches with [pcolor >= 125 and pcolor <= 135] [ set is-road? true ]
+
+  ; Fix rendering artifacts (The "Black Patch" bug)
+  ask patches with [pcolor = 0] [ set pcolor 5 ]
+
+  ; Algorithm: Intelligent Road Healer
+  ; Looks for disconnected road pixels and bridges them
+  repeat 5 [
+    ask patches with [pcolor = 5] [
+      if count neighbors with [is-road?] >= 4 [
+        set pcolor 130
+        set is-road? true
+      ]
+    ]
+  ]
+
+  ; Algorithm: Gap Closer
+  ask patches with [not is-road? and pcolor != 5] [
+    if count neighbors with [is-road?] >= 5 [
+      set is-road? true
+      set pcolor 130
+    ]
+  ]
+
+  ; Infrastructure Deployment
+  
+  ; Parse OSM Data for Traffic Signals
+  foreach gis:feature-list-of points-dataset [ feature ->
+    let highway-tag ""
+    carefully [ set highway-tag gis:property-value feature "highway" ] []
+
+    if (highway-tag = "traffic_signals") [
+      let loc gis:location-of (gis:centroid-of feature)
+      if not empty? loc [
+        let feat-x item 0 loc
+        let feat-y item 1 loc
+        let center-patch patch feat-x feat-y
+        if center-patch != nobody [
+          let road-p min-one-of ([patches in-radius 3 with [is-road?]] of center-patch) [distancexy feat-x feat-y]
+          if road-p != nobody [
+            ask road-p [
+              if not any? lights in-radius 2 [
+                sprout-lights 1 [
+                  set shape "circle"
+                  set size 2.5
+                  set color red
+                  set green? false
+                  set light-timer random 100
+                  set min-green-time 0
+                  set my-junction-patches patches in-radius 3 with [is-road?]
+                ]
+              ]
+            ]
+          ]
+        ]
+      ]
+    ]
+  ]
+  
+  output-print ">> Setup Complete. Ready to Start."
+  reset-ticks
+end
+
+;; Section 3: Main Execution Loop
+
+to go
+  ; Termination Logic
+  let limit 99999
+  
+  if time-termination = "1 Day"   [ set limit 1 ]
+  if time-termination = "1 Week"  [ set limit 7 ]
+  if time-termination = "1 Month" [ set limit 30 ]
+  if time-termination = "1 Year"  [ set limit 365 ]
+  
+  if days-elapsed >= limit [
+    print-final-report
+    stop
+  ]
+
+  ; Core Simulation
+  manage-traffic-flow    ; Spawn and route cars
+  
+  ask lights [           ; Update Infrastructure
+    ifelse traffic-light-mode = "Static"
+    [ operate-static-lights ]
+    [ operate-dynamic-lights ]
+  ]
+  
+  ask cars [             ; Update Agents
+    drive                ; Newton-like movement
+    calculate-emissions  ; Physics-based pollution
+  ]
+  
+  ; Data & UI
+  update-metrics
+  update-output-monitor  ; Real-time status log
+  
+  tick
+end
+
+;; Section 4: Traffic Flow Control
+
+to manage-traffic-flow
+  ; 1. Fleet Management (Spawning)
+  let deficit desired-car-count - count cars
+  if deficit > 0 [
+    let batch-size 1
+    if deficit > 50 [ set batch-size 5 ]
+    repeat batch-size [
+      let spawn-spot one-of patches with [is-road? and not any? cars-on self]
+      if spawn-spot != nobody [
+        ask spawn-spot [
+          sprout-cars 1 [
+            set shape "car" set color one-of [blue] set size 2.5
+            set max-speed 0.4 + random-float 0.4
+            set speed 0.1
+            set previous-speed 0.1 
+            set patience 2000
+            set my-emissions 0
+            
+            ; Navigation Init
+            set stuck-timer 0
+            pick-new-destination
+            set last-distance-to-target distance target-patch
+            
+            align-to-road 
+          ]
+        ]
+      ]
+    ]
+  ]
+
+  ; 2. Autonomous Navigation (GPS Logic)
+  ask cars [
+    ; Arrival Check (Radius 6)
+    if (distance target-patch < 6) [
+      set completed-trips completed-trips + 1
+      set patience 2000
+      pick-new-destination
+      set last-distance-to-target distance target-patch
+      set stuck-timer 0
+    ]
+
+    ; Anti-Stuck Logic (GPS Recalculation)
+    ; Checks progress every 50 ticks (approx 1 hour)
+    if (ticks mod 50 = 0) [
+      let current-dist distance target-patch
+      
+      ifelse (current-dist >= last-distance-to-target - 2) [
+        set stuck-timer stuck-timer + 1  ; Not moving closer
+      ] [
+        set stuck-timer 0                ; Moving fine
+      ]
+      set last-distance-to-target current-dist
+    ]
+    
+    ; "Recalculating..." 
+    ; If stuck for 3 checks, pick a new intermediate waypoint
+    if stuck-timer > 3 [
+      set target-patch one-of patches with [is-road? and distance myself < 40 and distance myself > 10]
+      if target-patch = nobody [ pick-new-destination ] 
+      set stuck-timer 0
+      set last-distance-to-target distance target-patch
+    ]
+
+    ; Patience Decay System
+    let red-light-ahead? false
+    let light-seen min-one-of lights in-cone 5 15 [distance myself]
+    if light-seen != nobody [ if [color] of light-seen = red [ set red-light-ahead? true ] ]
+    
+    ; Only get angry if stuck in traffic, not at lights
+    if speed < 0.1 and not red-light-ahead? [ set patience patience - 2 ]
+    
+    ; Tow Truck Logic (Despawn)
+    if (patience <= 0) [ die ]
+  ]
+end
+
+to pick-new-destination
+  set target-patch one-of patches with [is-road? and distance myself > 50]
+  if target-patch = nobody [ set target-patch one-of patches with [is-road?] ]
+end
+
+;; Section 5: Physics Engine (Movement & CO2)
+
+to drive
+  ; --- SENSOR ARRAY ---
+  let dist-to-obstacle 999
+  
+  ; Lidar: Car detection
+  let car-ahead min-one-of other cars in-cone 4 10 [distance myself]
+  if car-ahead != nobody [ set dist-to-obstacle distance car-ahead ]
+
+  ; Camera: Traffic Light detection (Wide Cone)
+  let light-ahead min-one-of lights in-cone 40 15 [distance myself]
+  
+  if light-ahead != nobody [
+    if [color] of light-ahead = red [
+       let d distance light-ahead
+       
+       ; Stop Line Physics (Halt 2.0m before light)
+       set d d - 2.0 
+       if d < 0 [ set d 0 ] 
+       
+       if d < dist-to-obstacle [ set dist-to-obstacle d ]
+    ]
+  ]
+
+  ; --- ONCOMING TRAFFIC AVOIDANCE ---
+  let oncoming? false
+  if car-ahead != nobody [
+    if abs (subtract-headings heading ([heading] of car-ahead)) > 135 [
+      set oncoming? true
+    ]
+  ]
+
+  ; Emergency Evasive Maneuvers
+  if oncoming? and dist-to-obstacle < 3 [
+    let pull-left patch-right-and-ahead -90 1
+    if pull-left != nobody and [is-road?] of pull-left and not any? cars-on pull-left [
+      face pull-left set speed 0.2 fd speed set patience 2000 stop
+    ]
+    if car-ahead != nobody and who > [who] of car-ahead [
+      let back-p patch-at-heading-and-distance (heading + 180) 1
+      if back-p != nobody and [is-road?] of back-p and not any? cars-on back-p [
+        set speed 0.2 bk speed set speed 0 stop
+      ]
+      set speed 0 stop
+    ]
+  ]
+
+  ; --- ACCELERATION / BRAKING PROFILE ---
+  let safe-gap 3.0 
+  let brake 0.4 
+  let accel 0.05
+
+  ifelse dist-to-obstacle < safe-gap [
+    set speed 0 ; Hard Stop
+  ] [
+    ifelse dist-to-obstacle < 10 [
+      ; Deceleration Curve
+      let desired-speed (dist-to-obstacle / 10) * max-speed
+      if speed > desired-speed [ set speed speed - brake ]
+      if speed < desired-speed [ set speed speed + 0.01 ]
+    ] [
+      ; Acceleration Curve
+      if speed < max-speed [ set speed speed + accel ]
+    ]
+  ]
+
+  ; Panic Brake (Red Light Violation Prevention)
+  if light-ahead != nobody and distance light-ahead < 1 and [color] of light-ahead = red [
+    set speed 0
+  ]
+
+  if speed < 0 [ set speed 0 ]
+  if speed > max-speed [ set speed max-speed ]
+
+  ; --- STEERING ALGORITHM ---
+  let best-patch nobody
+  let max-val -999999
+  let keep-left-bonus 3.0
+
+  foreach (list -15 0 -30 15 -45 30 45) [ angle ->
+    if not (oncoming? and angle > 0) [
+      let p patch-right-and-ahead angle 1.5
+      if (p != nobody) and [is-road?] of p and (not any? cars-on p) [
+        
+        let dist-score (- distance target-patch)
+        let angle-penalty (abs angle / 10)
+        let val (dist-score - angle-penalty)
+
+        if abs angle < 10 [ set val val + 3 ]
+        if angle < 0 [ set val val + keep-left-bonus ]
+        if angle > 0 [ set val val - keep-left-bonus ]
+
+        if val > max-val [ set max-val val set best-patch p ]
+      ]
+    ]
+  ]
+
+  ; Execute Movement
+  ifelse best-patch != nobody [
+    face best-patch
+    if speed > 0 [ fd speed ]
+    if speed > 0.1 [ set patience 2000 ]
+  ] [
+    ; Fallback (Stuck Handling)
+    let opts neighbors with [is-road?]
+    if any? opts [
+      let empty-opts opts with [not any? cars-on self]
+      if any? empty-opts [ set opts empty-opts ]
+      let next max-one-of opts [ (count neighbors with [is-road?]) * 10 - distance ([target-patch] of myself) ]
+      face next
+      if not any? cars-on next [ set speed max list speed 0.15 fd speed if speed > 0.1 [ set patience 2000 ] stop ]
+    ]
+    set speed 0
+  ]
+end
+
+to calculate-emissions
+  ; --- CO2 MODEL: MOMENTUM BASED ---
+  ; This calculates pollution based on change in velocity (Inertia).
+  ; It penalizes "Stop-Start" traffic heavily.
+
+  ; 1. Calculate Acceleration (Delta V)
+  let acceleration (speed - previous-speed)
+  if acceleration < 0 [ set acceleration 0 ]
+
+  ; 2. Define Physics Constants
+  ; Idle Emission increased to 0.5 to simulate engine inefficiency when stopped.
+  let idle-emission 0.5
+  
+  ; Cruise Emission is lower, rewarding steady flow.
+  let cruise-emission (speed * 0.05) 
+  
+  ; Acceleration Penalty: Energy required to overcome inertia.
+  let accel-penalty (acceleration * 2.0)
+
+  ; 3. Compute Tick Cost
+  let tick-pollution 0
+  
+  ifelse speed < 0.01 [
+    set tick-pollution idle-emission
+  ] [
+    set tick-pollution (cruise-emission + accel-penalty)
+  ]
+
+  ; 4. Accumulate
+  set my-emissions my-emissions + tick-pollution
+  set total-co2 total-co2 + tick-pollution
+  set previous-speed speed
+end
+
+;; Section 6: Infrastructure Logic (Lights & Time)
+
+to operate-static-lights
+  ; Dumb Timer Logic (Fixed Phase)
+  set light-timer light-timer - 1
+  if light-timer <= 0 [
+    set green? not green?
+    ifelse green?
+    [ set color green set light-timer 30 ] 
+    [ set color red set light-timer 30 ]
+  ]
+end
+
+to operate-dynamic-lights
+  ; Smart Sensor Logic
+  let queue-length count cars in-radius 10 with [speed < 0.1]
+  let approaching count cars in-radius 25 with [speed > 0.1 and facing-me?]
+  
+  ifelse green? [
+    ; --- GREEN PHASE LOGIC ---
+    set light-timer light-timer + 1
+    
+    ; 1. MAX TIMEOUT (Prevent infinite green starvation)
+    if light-timer > 800 [ set green? false set color red set light-timer 20 ]
+    
+    ; 2. GAP OUT (Efficiency Switch)
+    ; If the road is empty, switch immediately to let others pass.
+    if (approaching = 0) and (queue-length = 0) and (light-timer > 20) [
+       set green? false set color red set light-timer 20 
+    ]
+    
+    ; 3. GREEN WAVE EXTENSION
+    ; If cars are approaching, HOLD the green to maintain momentum.
+    if approaching > 0 [ set light-timer 0 ]
+    
+  ] [
+    ; --- RED PHASE LOGIC ---
+    set light-timer light-timer - 1
+    
+    ; 4. INSTANT DEMAND RESPONSE
+    ; If a car is waiting, switch immediately.
+    if (queue-length > 0) [ 
+       set green? true set color green set light-timer 0 
+    ]
+    
+    ; 5. APPROACH TRIGGER
+    ; If a car is coming fast, turn green BEFORE they brake (Physics optimization).
+    if (approaching > 0) [
+       set green? true set color green set light-timer 0
+    ]
+  ]
+end
+
+to-report facing-me?
+  report abs (subtract-headings heading (towards myself)) < 45
+end
+
+to align-to-road
+  let opts neighbors with [is-road?]
+  if any? opts [
+    let best max-one-of opts [
+      (count neighbors with [is-road?]) * 10
+      - distance ([target-patch] of myself)
+    ]
+    face best
+  ]
+end
+
+;; Section 7: Metrics, Logging & Output
+
+to update-metrics
+  ; Calendar Math
+  let start-minutes 360
+  let current-total-minutes start-minutes + ticks
+  let hour floor (current-total-minutes / 60)
+  let minute (current-total-minutes mod 60)
+
+  let new-days-passed floor (current-total-minutes / 1440)
+  if new-days-passed > days-tracker [
+    set days-tracker new-days-passed
+    set days-elapsed days-elapsed + 1
+    advance-date
+  ]
+
+  ; Time formatting
+  set hour (hour mod 24)
+  let am-pm "AM"
+  if hour >= 12 [ set am-pm "PM" ]
+  if hour > 12 [ set hour hour - 12 ]
+  if hour = 0 [ set hour 12 ]
+
+  let min-str (word minute)
+  if minute < 10 [ set min-str (word "0" minute) ]
+  set current-time-string (word hour ":" min-str " " am-pm)
+
+  ; Fleet Stats
+  ifelse count cars > 0 [ 
+    set avg-speed mean [speed] of cars
+    set avg-speed-mph (avg-speed * 50)
+    set stopped-cars-count count cars with [speed < 0.1]
+    
+    ; Calculate Congestion %
+    set congestion-percent (stopped-cars-count / count cars) * 100
+  ] [ 
+    set avg-speed 0
+    set avg-speed-mph 0
+    set congestion-percent 0
+  ]
+end
+
+to advance-date
+  set sim-day sim-day + 1
+  let days-in-this-month 31
+  if sim-month = 2 [ set days-in-this-month 28 ]
+  if (sim-month = 4) or (sim-month = 6) or (sim-month = 9) or (sim-month = 11) [ set days-in-this-month 30 ]
+  if sim-day > days-in-this-month [
+    set sim-day 1
+    set sim-month sim-month + 1
+    if sim-month > 12 [
+      set sim-month 1
+      set sim-year sim-year + 1
+    ]
+  ]
+  update-date-string
+end
+
+to update-date-string
+  if sim-month < 1 [ set sim-month 1 ]
+  let month-name item (sim-month - 1) ["Jan" "Feb" "Mar" "Apr" "May" "Jun" "Jul" "Aug" "Sep" "Oct" "Nov" "Dec"]
+  let day-str (word sim-day)
+  if sim-day < 10 [ set day-str (word "0" sim-day) ]
+  set current-date-string (word month-name " " day-str ", " sim-year)
+end
+
+to update-output-monitor
+  ; Updates the output window every 10 ticks with live data
+  ; This prevents the window from being empty until the very end.
+  if ticks mod 10 = 0 [
+    clear-output
+    output-print "======================================"
+    output-print "       LIVE SIMULATION STATUS         "
+    output-print "======================================"
+    output-print (word "System Date:   " current-date-string)
+    output-print (word "System Time:   " current-time-string)
+    output-print ""
+    output-print (word "Active Cars:   " count cars)
+    output-print (word "Congestion:    " precision congestion-percent 1 "%")
+    output-print (word "Total CO2:     " precision total-co2 0 " kg")
+    output-print (word "Total Trips:   " completed-trips)
+    output-print ""
+    output-print ">> Simulation running..."
+  ]
+end
+
+to print-final-report
+    ; Generate the copy-paste block for Excel
+    clear-output
+    output-print "-------------------------------------------"
+    output-print (word "FINAL RESULTS REPORT")
+    output-print (word "Date Reached: " current-date-string)
+    output-print "-------------------------------------------"
+    output-print ">> COPY THE TWO LINES BELOW FOR EXCEL <<"
+    output-print ""
+    output-print "Mode,Cars,Duration,Total_CO2,Avg_Speed,Trips_Done"
+    output-print (word traffic-light-mode "," desired-car-count "," time-termination "," precision total-co2 2 "," precision avg-speed-mph 2 "," completed-trips)
+    output-print ""
+    output-print "-------------------------------------------"
+end]]></code>
+  <widgets>
+    <view x="670" wrappingAllowedX="true" y="50" frameRate="60.0" minPycor="0" height="639" showTickCounter="true" patchSize="1.0" fontSize="4" wrappingAllowedY="true" width="1005" tickCounterLabel="ticks" maxPycor="634" updateMode="0" maxPxcor="1000" minPxcor="0"></view>
+    <note x="675" y="0" backgroundDark="0" fontSize="23" width="800" markdown="false" height="45" textColorDark="-1184463" textColorLight="-16777216" backgroundLight="16711680">Switch to 3D view and zoom in to get a close look to the agents behaviour</note>
+    <chooser x="530" y="0" height="60" variable="time-termination" current="0" width="140" display="time-termination">
+      <choice type="string" value="1 Day"></choice>
+      <choice type="string" value="1 Week"></choice>
+      <choice type="string" value="1 Month"></choice>
+      <choice type="string" value="1 Year"></choice>
+    </chooser>
+    <monitor x="534" precision="17" y="65" height="60" fontSize="11" width="135" display="Simulation Date">current-date-string</monitor>
+    <monitor x="534" precision="17" y="130" height="60" fontSize="11" width="135" display="City Clock">current-time-string</monitor>
+    <plot x="265" autoPlotX="true" yMax="10.0" autoPlotY="true" yAxis="Kg of CO2" y="245" xMin="0.0" height="175" legend="false" xMax="10.0" yMin="0.0" width="225" xAxis="Time (Hours)" display="CO2 Consumption">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Total Emissions" color="-16777216" legend="true">
+        <setup></setup>
+        <update>plot total-co2</update>
+      </pen>
+    </plot>
+    <plot x="30" autoPlotX="true" yMax="10.0" autoPlotY="true" yAxis="Speed (MPH)" y="245" xMin="0.0" height="175" legend="false" xMax="10.0" yMin="0.0" width="230" xAxis="Time (Hours)" display="Average Speed">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Speed" color="-16777216" legend="true">
+        <setup></setup>
+        <update>plot avg-speed-mph</update>
+      </pen>
+    </plot>
+    <button x="205" y="10" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="75" display="go">go</button>
+    <button x="125" y="10" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="76" display="Map Setup">setup</button>
+    <chooser x="120" y="110" height="60" variable="traffic-light-mode" current="0" width="250" display="traffic-light-mode">
+      <choice type="string" value="Static"></choice>
+      <choice type="string" value="Dynamic"></choice>
+    </chooser>
+    <slider x="120" step="1" y="55" max="10000" width="250" display="desired-car-count" height="50" min="0" direction="Horizontal" default="250.0" variable="desired-car-count"></slider>
+    <button x="285" y="10" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="70" display="Reset cars">setup-traffic</button>
+    <monitor x="30" precision="1" y="180" height="60" fontSize="11" width="135" display="Avg Fleet Speed (MPH">avg-speed-mph</monitor>
+    <monitor x="265" precision="2" y="180" height="60" fontSize="11" width="145" display="Total CO2 (kg)">total-co2</monitor>
+    <plot x="30" autoPlotX="true" yMax="10.0" autoPlotY="true" yAxis="Trips" y="490" xMin="0.0" height="175" legend="false" xMax="10.0" yMin="0.0" width="230" xAxis="Time" display="Completed Trips">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Finished" color="-16777216" legend="true">
+        <setup></setup>
+        <update>plot completed-trips</update>
+      </pen>
+    </plot>
+    <plot x="265" autoPlotX="true" yMax="10.0" autoPlotY="true" yAxis="Stuck Cars" y="490" xMin="0.0" height="175" legend="false" xMax="10.0" yMin="0.0" width="230" xAxis="Time" display="Congestion Levels">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Stuck" color="-16777216" legend="true">
+        <setup></setup>
+        <update>plot stopped-cars-count</update>
+      </pen>
+    </plot>
+    <monitor x="270" precision="1" y="425" height="60" fontSize="11" width="135" display="Congestion %">congestion-percent</monitor>
+    <monitor x="30" precision="0" y="425" height="60" fontSize="11" width="140" display="Total trips">completed-trips</monitor>
+    <output x="35" y="670" height="235" fontSize="12" width="465"></output>
+  </widgets>
+  <info>## WHAT IS IT?
+
+(a general understanding of what the model is trying to show or explain)
+
+## HOW IT WORKS
+
+(what rules the agents use to create the overall behavior of the model)
+
+## HOW TO USE IT
+
+(how to use the model, including a description of each of the items in the Interface tab)
+
+## THINGS TO NOTICE
+
+(suggested things for the user to notice while running the model)
+
+## THINGS TO TRY
+
+(suggested things for the user to try to do (move sliders, switches, etc.) with the model)
+
+## EXTENDING THE MODEL
+
+(suggested things to add or change in the Code tab to make the model more complicated, detailed, accurate, etc.)
+
+## NETLOGO FEATURES
+
+(interesting or unusual features of NetLogo that the model uses, particularly in the Code tab; or where workarounds were needed for missing features)
+
+## RELATED MODELS
+
+(models in the NetLogo Models Library and elsewhere which are of related interest)
+
+## CREDITS AND REFERENCES
+
+(a reference to the model's URL on the web if it has one, as well as any other necessary credits, citations, and links)
+</info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true"></circle>
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true"></circle>
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120"></point>
+        <point x="240" y="165"></point>
+        <point x="255" y="165"></point>
+        <point x="278" y="120"></point>
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true"></circle>
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285"></point>
+        <point x="30" y="285"></point>
+        <point x="30" y="240"></point>
+        <point x="15" y="195"></point>
+        <point x="45" y="210"></point>
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true"></circle>
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285"></point>
+        <point x="210" y="285"></point>
+        <point x="210" y="240"></point>
+        <point x="240" y="210"></point>
+        <point x="195" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85"></point>
+        <point x="285" y="105"></point>
+        <point x="302" y="99"></point>
+        <point x="294" y="83"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85"></point>
+        <point x="210" y="105"></point>
+        <point x="193" y="99"></point>
+        <point x="201" y="83"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133"></point>
+        <point x="245" y="131"></point>
+        <point x="245" y="133"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194"></point>
+        <point x="13" y="197"></point>
+        <point x="30" y="191"></point>
+        <point x="38" y="193"></point>
+        <point x="38" y="205"></point>
+        <point x="20" y="226"></point>
+        <point x="20" y="257"></point>
+        <point x="27" y="265"></point>
+        <point x="38" y="266"></point>
+        <point x="40" y="260"></point>
+        <point x="31" y="253"></point>
+        <point x="31" y="230"></point>
+        <point x="60" y="206"></point>
+        <point x="68" y="198"></point>
+        <point x="75" y="209"></point>
+        <point x="66" y="228"></point>
+        <point x="65" y="243"></point>
+        <point x="82" y="261"></point>
+        <point x="84" y="268"></point>
+        <point x="100" y="267"></point>
+        <point x="103" y="261"></point>
+        <point x="77" y="239"></point>
+        <point x="79" y="231"></point>
+        <point x="100" y="207"></point>
+        <point x="98" y="196"></point>
+        <point x="119" y="201"></point>
+        <point x="143" y="202"></point>
+        <point x="160" y="195"></point>
+        <point x="166" y="210"></point>
+        <point x="172" y="213"></point>
+        <point x="173" y="238"></point>
+        <point x="167" y="251"></point>
+        <point x="160" y="248"></point>
+        <point x="154" y="265"></point>
+        <point x="169" y="264"></point>
+        <point x="178" y="247"></point>
+        <point x="186" y="240"></point>
+        <point x="198" y="260"></point>
+        <point x="200" y="271"></point>
+        <point x="217" y="271"></point>
+        <point x="219" y="262"></point>
+        <point x="207" y="258"></point>
+        <point x="195" y="230"></point>
+        <point x="192" y="198"></point>
+        <point x="210" y="184"></point>
+        <point x="227" y="164"></point>
+        <point x="242" y="144"></point>
+        <point x="259" y="145"></point>
+        <point x="284" y="151"></point>
+        <point x="277" y="141"></point>
+        <point x="293" y="140"></point>
+        <point x="299" y="134"></point>
+        <point x="297" y="127"></point>
+        <point x="273" y="119"></point>
+        <point x="270" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195"></point>
+        <point x="14" y="180"></point>
+        <point x="36" y="166"></point>
+        <point x="40" y="153"></point>
+        <point x="53" y="140"></point>
+        <point x="82" y="131"></point>
+        <point x="134" y="133"></point>
+        <point x="159" y="126"></point>
+        <point x="188" y="115"></point>
+        <point x="227" y="108"></point>
+        <point x="236" y="102"></point>
+        <point x="238" y="98"></point>
+        <point x="268" y="86"></point>
+        <point x="269" y="92"></point>
+        <point x="281" y="87"></point>
+        <point x="269" y="103"></point>
+        <point x="269" y="113"></point>
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+  <experiments>
+    <experiment name="Static_vs_Dynamic_Comparison_1Month" repetitions="10" sequentialRunOrder="true" runMetricsEveryStep="false" timeLimit="403200">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>traffic-light-mode</metric>
+        <metric>completed-trips</metric>
+        <metric>total-co2</metric>
+        <metric>avg-speed-mph</metric>
+        <metric>stopped-cars-count</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="time-termination">
+          <value value="&quot;1 Month&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="traffic-light-mode">
+          <value value="&quot;Static&quot;"></value>
+          <value value="&quot;Dynamic&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="desired-car-count">
+          <value value="250"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+  </experiments>
+</model>
